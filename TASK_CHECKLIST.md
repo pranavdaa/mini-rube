@@ -11,7 +11,7 @@ Tick as **verified**, not as written. `[~]` = built but unverified. Log failures
 - [ ] Connect Google via UI; connection reaches ACTIVE
 - [ ] Send one email through chat (scaffold's hardcoded tool) — proves auth + execution before writing any of our code
 - [ ] Confirm `@composio/core` has the APIs we need (scaffold pins `^0.2.6`; pre-work used 0.13.1)
-- [ ] **Early risk probe:** list the Drive resume folder + download 1 PDF. Does it have a text layer, or is it a scan? (Changes the whole extraction design — find out now, not at hour 4)
+- [x] **Early risk probe:** list the Drive resume folder + download 1 PDF. Does it have a text layer, or is it a scan? — verified on the first 5 files: all `application/pdf`, `%PDF-` header, 1 page each, 735–1,063 chars of extracted text (no image-only scans), extraction correct on all 5. No OCR/vision path needed.
 - [ ] Commit: scaffold baseline
 
 ## 1 — Catalog (~30m)
@@ -40,7 +40,7 @@ Tick as **verified**, not as written. `[~]` = built but unverified. Log failures
 - [ ] `maxSteps` sufficient for multi-step chains (scaffold default 10)
 - [ ] **Prompt 1**: last 100 emails → important ones
 - [ ] **Prompt 2**: contact resolved first, event created, **full email never shown**
-- [ ] **Prompt 5**: real PDF attached and sent
+- [x] **Prompt 5**: real PDF attached and sent — verified live via `runTurn`: sent to own address, re-fetched the message, confirmed a real `mini-rube-test.pdf` attachment part (see WORKLOG.MD)
 - [ ] Variations of 1/2/5 work (different wording, not the exact text)
 - [ ] Commit: dynamic routing
 
@@ -66,14 +66,14 @@ Tick as **verified**, not as written. `[~]` = built but unverified. Log failures
 
 ## 6 — Bulk: Drive resumes (~45m)
 
-- [ ] Folder id parsed from the URL
-- [ ] Paginate until every file discovered (expect ~1,000)
-- [ ] Bounded concurrency (start 5), retry with backoff
-- [ ] Per-file extract → `{name, university, last_job}` via small isolated model call
-- [ ] `Unknown` for missing fields; source filename + status columns
-- [ ] Extraction failures recorded, not dropped
-- [ ] Ladder: 5 → 25 → 100 → **all (~1,000)**
-- [ ] **Assert: files discovered == rows written**
+- [x] Folder id parsed from the URL
+- [x] Paginate until every file discovered (expect ~1,000) — **1,000 discovered, 0 dropped**
+- [x] Bounded concurrency (start 5), retry with backoff — default concurrency 5, withRetry on network failures
+- [x] Per-file extract → `{name, university, last_job}` via small isolated model call — resumeCandidateTransform, gpt-4o-mini (OpenRouter)
+- [x] `Unknown` for missing fields; source filename + status columns — zero Unknown fields across all 1,000 (100% extraction rate)
+- [x] Extraction failures recorded, not dropped — status column is "ok" or "Extraction failed: <reason>"; no silent drops
+- [x] Ladder: 5 → 25 → 100 → **all (~1,000)** — 25 ok, 100 ok, 1000 ok
+- [x] **Assert: files discovered == rows written** — 1,000 discovered = 1,000 processed = 1,001 rows (incl header) ✓
 - [ ] Commit: resume bulk export
 
 ## 7 — UX (~45m)
@@ -83,7 +83,7 @@ Tick as **verified**, not as written. `[~]` = built but unverified. Log failures
 - [ ] Execution status rows; auth-required states clear
 - [ ] Bulk progress (`247 / 1000`) + final sheet link
 - [ ] Partial failures surfaced
-- [ ] PDF upload: filename shown, removable, type/size validated
+- [x] PDF upload: filename shown, removable, type/size validated (client pre-check + server-side re-validation in attachments.ts)
 - [ ] Never rendered: keys, tokens, full contact emails, raw bodies/resume text, local paths
 
 ## 8 — Submission
@@ -111,7 +111,7 @@ Tick as **verified**, not as written. `[~]` = built but unverified. Log failures
 - [ ] Full contact email is not shown to the user
 - [ ] All open and closed composiohq/composio issues reach a Google Sheet
 - [ ] All resumes in the supplied folder reach a Google Sheet
-- [ ] PDF can be attached to an outgoing email
+- [x] PDF can be attached to an outgoing email
 - [ ] Large datasets never enter the main agent context
 - [ ] Similar prompt variations work
 - [ ] Application runs locally
