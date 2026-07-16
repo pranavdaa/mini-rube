@@ -1,51 +1,29 @@
-import { createOpenAI } from "@ai-sdk/openai";
-import { streamText, tool, jsonSchema, type CoreMessage } from "ai";
+import { type CoreMessage } from "ai";
 import { AUTH_CONFIGS } from "./lib/composio";
 import { connectAccount } from "./lib/auth";
-import { getTool, executeTool, listToolSlugs } from "./lib/tools";
+import { getTool } from "./lib/tools";
+import { getRouter } from "./lib/router/router";
+import { runTurn } from "./lib/agent";
 
+/**
+ * The user the OAuth connection is bound to. Auth, connection status, and every
+ * tool execution must use this same id — a mismatch fails at execution time
+ * while still reporting the account as "connected".
+ */
 const USER_ID = "candidate";
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-
-if (!OPENROUTER_API_KEY) {
-  throw new Error("OPENROUTER_API_KEY is not set");
-}
-
-const openrouter = createOpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: OPENROUTER_API_KEY,
-});
 
 // pending OAuth connections waiting for completion
 const pendingConnections = new Map<string, Awaited<ReturnType<typeof connectAccount>>>();
 
-// the currently loaded tool — starts with just GOOGLESUPER_SEND_EMAIL.
-// your job is to build a router that picks the right tool(s) for each prompt.
+/**
+ * Vestigial: the scaffold's manual tool picker. Chat no longer reads this —
+ * tools are routed per turn (see lib/agent.ts) — but /api/tool and
+ * /api/tool/set stay so the current frontend keeps working until the UX task
+ * replaces the picker with router step-rows.
+ */
 let activeComposioTool = await getTool("GOOGLESUPER_SEND_EMAIL");
 if (!activeComposioTool) {
   throw new Error("Failed to load GOOGLESUPER_SEND_EMAIL tool");
-}
-
-// convert a composio tool into an AI SDK tool
-function makeAITool(composioTool: NonNullable<typeof activeComposioTool>) {
-  const slug = composioTool.slug ?? composioTool.name;
-  return {
-    [slug]: tool({
-      description: composioTool.description ?? slug,
-      parameters: jsonSchema(
-        composioTool.inputParameters ?? { type: "object", properties: {} }
-      ),
-      execute: async (args: Record<string, unknown>) => {
-        console.log(`[tool] ${slug}`, args);
-        try {
-          return await executeTool(slug, USER_ID, args);
-        } catch (err: any) {
-          console.error(`[tool error] ${slug}:`, err.message, err.cause ?? "", JSON.stringify(err, null, 2));
-          return { error: err.message };
-        }
-      },
-    }),
-  };
 }
 
 Bun.serve({
@@ -112,32 +90,36 @@ Bun.serve({
       }
     }
 
-    // /api/tools
+    // /api/tools — served from the router's complete catalog. The scaffold's
+    // listToolSlugs({limit: 500}) truncates alphabetically against 1,360 tools,
+    // so it silently omitted everything past the cut (GITHUB_LIST_REPOSITORY_
+    // ISSUES among them).
     if (path === "/api/tools" && req.method === "GET") {
       try {
-        const tools = await listToolSlugs();
-        return Response.json({ tools });
+        const router = await getRouter();
+        return Response.json({
+          tools: router.all.map((t) => ({ slug: t.slug, description: t.description })),
+          counts: router.counts,
+          total: router.toolCount,
+        });
       } catch (err: any) {
         return Response.json({ error: err.message }, { status: 500 });
       }
     }
 
-    // /api/chat
+    // /api/chat — router-driven: the tools are chosen per turn, not hardcoded.
     if (path === "/api/chat" && req.method === "POST") {
       const body = await req.json();
       const messages: CoreMessage[] = body.messages ?? [];
 
-      const toolName = activeComposioTool!.slug ?? activeComposioTool!.name;
-
-      const result = streamText({
-        model: openrouter("moonshotai/kimi-k2"),
-        system: `You are a helpful assistant. You have one tool available: ${toolName}. Use it to fulfill the user's request. Be concise.`,
-        messages,
-        tools: makeAITool(activeComposioTool!),
-        maxSteps: 10,
-      });
-
-      return result.toDataStreamResponse();
+      try {
+        // route → bound selection → lazy schemas → model. See lib/agent.ts.
+        const { result } = await runTurn(messages, USER_ID);
+        return result.toDataStreamResponse();
+      } catch (err: any) {
+        console.error(`[chat] ${err.message}`);
+        return Response.json({ error: err.message }, { status: 500 });
+      }
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });

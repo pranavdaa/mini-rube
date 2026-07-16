@@ -61,7 +61,7 @@ export interface RouterCandidate {
 export interface ParsedQuery {
   /** The user's own words, minus stopwords. */
   baseTerms: string[];
-  /** [expansion, sourceTerm] pairs added by synonym expansion. */
+  /** [derivedTerm, sourceTerm] pairs — stems and synonym expansions alike. */
   expandedTerms: [string, string][];
   /** Action verbs found in the query. */
   intents: string[];

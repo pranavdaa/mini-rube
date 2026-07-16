@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "bun --hot src/server.ts & vite",
-    "server": "bun --hot src/server.ts"
+    "server": "bun --hot src/server.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/openai": "^1",

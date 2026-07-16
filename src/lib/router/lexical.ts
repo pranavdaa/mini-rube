@@ -34,11 +34,21 @@ const INTENT_BONUS = 0.8;
 /** Minimum score to be considered a match at all. */
 const SCORE_FLOOR = 0.01;
 
+/**
+ * Split on non-alphanumerics, and additionally on letter/digit boundaries so
+ * GOOGLESUPER_CREATE_GOOGLE_SHEET1 yields "sheet", not the unmatchable
+ * "sheet1" — which is otherwise invisible to the query "spreadsheet".
+ *
+ * Bare numbers are dropped: the "1" in SHEET1 carries no meaning and only adds
+ * a high-frequency token to the index.
+ */
 export function tokenize(s: string): string[] {
   return s
     .toLowerCase()
+    .replace(/([a-z])(\d)/g, "$1 $2")
+    .replace(/(\d)([a-z])/g, "$1 $2")
     .split(/[^a-z0-9]+/)
-    .filter((w) => w && !STOPWORDS.has(w));
+    .filter((w) => w && !/^\d+$/.test(w) && !STOPWORDS.has(w));
 }
 
 interface Doc {
@@ -116,12 +126,21 @@ export class LexicalIndex {
       terms.set(term, { weight: 1, from: null });
 
       const stem = term.length > 3 && term.endsWith("s") ? term.slice(0, -1) : null;
-      if (stem && !terms.has(stem)) terms.set(stem, { weight: STEM_WEIGHT, from: term });
+      if (stem && !terms.has(stem)) {
+        terms.set(stem, { weight: STEM_WEIGHT, from: term });
+        expandedTerms.push([stem, term]);
+      }
 
-      for (const expansion of SYNONYMS[term] ?? []) {
-        if (terms.has(expansion)) continue;
-        terms.set(expansion, { weight: EXPANSION_WEIGHT, from: term });
-        expandedTerms.push([expansion, term]);
+      // Expand from the stem as well as the typed word. Synonyms are keyed by
+      // singular ("message" -> email/mail/thread), so looking up only the raw
+      // term silently drops every expansion for a plural query: "find urgent
+      // messages" would never reach FETCH_EMAILS, whose slug says EMAILS.
+      for (const source of stem ? [term, stem] : [term]) {
+        for (const expansion of SYNONYMS[source] ?? []) {
+          if (terms.has(expansion)) continue;
+          terms.set(expansion, { weight: EXPANSION_WEIGHT, from: term });
+          expandedTerms.push([expansion, term]);
+        }
       }
     }
 

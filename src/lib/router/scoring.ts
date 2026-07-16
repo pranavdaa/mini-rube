@@ -15,9 +15,27 @@ const FACET_MISS_PENALTY = 0.7;
 /** Provider-flagged commonly-used tool. */
 const IMPORTANT_BOOST = 1.2;
 
-/** Query intent agrees / disagrees with the tool's read-write nature. */
-const ASPECT_MATCH = 1.25;
-const ASPECT_MISMATCH = 0.8;
+/** Query intent agrees with the tool's read-write nature. */
+const ASPECT_MATCH = 1.3;
+
+/**
+ * Aspect mismatch is deliberately **asymmetric**, because the two directions
+ * are not symmetric mistakes:
+ *
+ *  - read query + write tool: almost always wrong, and unsafe. "find urgent
+ *    messages in my inbox" must not rank BATCH_MODIFY_MESSAGES, which shares
+ *    the word "messages" in its *slug* (weight 3) while FETCH_EMAILS only earns
+ *    it from its description (weight 1). Nothing but the provider's readOnlyHint
+ *    separates them, so the penalty has to be strong enough to overturn a
+ *    slug-versus-description gap.
+ *
+ *  - write query + read tool: frequently *correct*, because read tools are the
+ *    hidden prerequisites of write chains — search contacts before creating an
+ *    event, list issues before filling a sheet. Penalise this the same way and
+ *    the router hides the doorway to the task it just accepted.
+ */
+const READ_QUERY_WRITE_TOOL = 0.4;
+const WRITE_QUERY_READ_TOOL = 0.85;
 
 /** Deprecated tools still rank, but must never outrank a live equivalent. */
 const DEPRECATED_PENALTY = 0.5;
@@ -35,13 +53,25 @@ const DEPRECATED_PENALTY = 0.5;
  * dominate would demote precisely the prerequisite the chain cannot start
  * without — the router would rank the destination and hide the doorway.
  */
-export function queryAspect(tokens: string[]): QueryAspect {
+export function queryAspect(tokens: string[], raw?: string): QueryAspect {
   const read = tokens.some((t) => READ_VERBS.has(t));
   const write = tokens.some((t) => WRITE_VERBS.has(t));
   if (read && write) return "mixed";
   if (write) return "write";
   if (read) return "read";
+  // No verb at all: a question is a request to read. "What events do I have
+  // tomorrow?" carries no action verb — "what" is a stopword and "have" is not
+  // a verb we track — so without this it scores as intentless and ranks
+  // SEND_EVENTS alongside EVENTS_GET. Checked last, so an explicit write verb
+  // always wins ("Can you send an email?" stays 'write').
+  if (raw && isQuestion(raw)) return "read";
   return null;
+}
+
+const INTERROGATIVES = /^\s*(what|which|who|whose|when|where|why|how|do|does|did|is|are|was|were|am|can|could|any)\b/i;
+
+function isQuestion(raw: string): boolean {
+  return raw.trimEnd().endsWith("?") || INTERROGATIVES.test(raw);
 }
 
 /** Tool aspect from the provider's hint, falling back to the slug's verb. */
@@ -67,9 +97,32 @@ export function hintedToolkits(tokens: Set<string>, facets: Facet[], toolkits: s
   return hinted;
 }
 
-/** True when any of the facet's markers appear in the tool's slug or tags. */
+/**
+ * True when any of the facet's markers appear in the tool's slug, tags, or
+ * description.
+ *
+ * The description is included because inside googlesuper the slug and tags are
+ * often not enough to tell one product from another — GOOGLESUPER_FIND_EVENT
+ * and GOOGLESUPER_LIST_CONVERSION_EVENTS have equally "eventful" slugs, and
+ * only the prose says "Google Calendar" versus "on a property".
+ */
+const facetTextCache = new WeakMap<CompactTool, Set<string>>();
+
+function facetText(tool: CompactTool): Set<string> {
+  let tokens = facetTextCache.get(tool);
+  if (!tokens) {
+    tokens = new Set([
+      ...tokenize(tool.slug),
+      ...tool.tags.flatMap(tokenize),
+      ...tokenize(tool.description),
+    ]);
+    facetTextCache.set(tool, tokens);
+  }
+  return tokens;
+}
+
 function facetMatches(facet: Facet, tool: CompactTool): boolean {
-  const tokens = new Set([...tokenize(tool.slug), ...tool.tags.flatMap(tokenize)]);
+  const tokens = facetText(tool);
   return facet.markers.some((m) => tokens.has(m));
 }
 
@@ -127,7 +180,12 @@ export function applyBoosts(hits: ScoredTool[], ctx: BoostContext): ScoredTool[]
     // 'mixed' intentionally applies no pressure — see queryAspect.
     if (ctx.aspect === "read" || ctx.aspect === "write") {
       const ta = toolAspect(tool);
-      const factor = ta === ctx.aspect ? ASPECT_MATCH : ASPECT_MISMATCH;
+      const factor =
+        ta === ctx.aspect
+          ? ASPECT_MATCH
+          : ctx.aspect === "read"
+            ? READ_QUERY_WRITE_TOOL
+            : WRITE_QUERY_READ_TOOL;
       score *= factor;
       signals.push(`aspect:${ctx.aspect}/${ta} ×${factor}`);
     }

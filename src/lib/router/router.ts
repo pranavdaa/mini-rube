@@ -36,6 +36,11 @@ export class Router {
     return catalogCounts(this.tools);
   }
 
+  /** The full compact catalog. Metadata only — never input schemas. */
+  get all(): readonly CompactTool[] {
+    return this.tools;
+  }
+
   /** Compact metadata for one slug. Full schemas are loaded elsewhere, lazily. */
   getTool(slug: string): CompactTool | undefined {
     return this.bySlug.get(slug);
@@ -48,7 +53,7 @@ export class Router {
     const tokens = new Set(parse.baseTerms);
     const facets = hintedFacets(tokens);
     const toolkits = hintedToolkits(tokens, facets, this.toolkits);
-    const aspect = queryAspect(parse.baseTerms);
+    const aspect = queryAspect(parse.baseTerms, query);
 
     const ranked = applyBoosts(hits, { aspect, facets, toolkits });
 

@@ -8,9 +8,16 @@
  * spreadsheet". FACETS restore that distinction inside a toolkit.
  */
 
+/**
+ * Note "make" is deliberately *not* a stopword, though the pre-work listed it
+ * as one. "read all the issues and make a google sheet" is the assignment's
+ * own phrasing: drop "make" and the query reads as pure intent-to-read, the
+ * sheet-writing half of the request disappears, and the tools that satisfy it
+ * sink hundreds of ranks.
+ */
 export const STOPWORDS = new Set(
   ("a an the to for of in on at by is it as be are was my me and or with from into about " +
-    "that this all when then them their our your one do make please can you i we us using via " +
+    "that this all when then them their our your one do please can you i we us using via " +
     "if after every each up out some any there here what which who how new latest s " +
     "item items thing things stuff info information detail details data")
     .split(" ")
@@ -102,7 +109,14 @@ export const ACTION_VERBS = new Set(
     .split(" ")
 );
 
-/** Verbs implying the user wants to read state. */
+/**
+ * Verbs implying the user wants to read state.
+ *
+ * A genuinely ambiguous verb belongs in *both* sets: "export the issues to a
+ * sheet" reads issues and writes rows. Membership in both yields aspect
+ * 'mixed', which applies no read/write pressure — the honest answer when the
+ * verb itself does not disambiguate.
+ */
 export const READ_VERBS = new Set(
   ("get fetch list read check find search show view lookup summarize review analyze " +
     "download export report")
@@ -112,7 +126,8 @@ export const READ_VERBS = new Set(
 /** Verbs implying the user wants to change state. */
 export const WRITE_VERBS = new Set(
   ("send create update delete add post reply draft schedule merge upload share assign " +
-    "cancel publish close append modify remove set move label attach import insert write make")
+    "cancel publish close append modify remove set move label attach import insert write make " +
+    "export")
     .split(" ")
 );
 
@@ -123,8 +138,15 @@ export const READ_SLUG_VERBS = ["GET", "FETCH", "LIST", "SEARCH", "QUERY", "FIND
  * Sub-app facets.
  *
  * `hints` are words a user types; `markers` are tokens that appear in the real
- * slugs/tags of tools in that facet. A facet matches a tool when any marker is
- * present in its slug tokens or tags.
+ * slug/tags/description of tools in that facet. A facet matches a tool when any
+ * marker is present in that text.
+ *
+ * Markers must be *distinctive product vocabulary*, not generic nouns. Inside
+ * googlesuper, Calendar and Analytics both own the word "events"
+ * (GOOGLESUPER_EVENTS_GET vs GOOGLESUPER_LIST_CONVERSION_EVENTS), and the
+ * provider's tags collide too — "Events Management" is Calendar while "Event
+ * Management" is Analytics. So the calendar facet keys off "calendar",
+ * "recurring", "timemin" and friends, which Analytics never says.
  *
  * Facets are additive metadata over the live catalog, not a hardcoded tool list:
  * a new toolkit works without facets (falling back to toolkit-level affinity),
@@ -148,7 +170,9 @@ export const FACETS: Facet[] = [
     id: "calendar",
     toolkit: "googlesuper",
     hints: ["calendar", "event", "events", "meeting", "meetings", "schedule", "invite", "appointment", "availability", "slot", "slots", "reschedule"],
-    markers: ["event", "events", "calendar", "calendars", "freebusy", "attendee", "recurrence"],
+    // Deliberately excludes bare "event"/"events" — Google Analytics tools in
+    // this same toolkit use both, and would ride the calendar boost.
+    markers: ["calendar", "calendars", "freebusy", "attendee", "attendees", "recurrence", "recurring", "timemin", "timemax", "ical"],
   },
   {
     id: "contacts",
