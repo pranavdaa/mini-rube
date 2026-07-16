@@ -1,0 +1,145 @@
+import { FACETS, READ_VERBS, WRITE_VERBS, READ_SLUG_VERBS, type Facet } from "./aliases";
+import { tokenize } from "./lexical";
+import type { CompactTool, QueryAspect, ScoredTool, ToolAspect } from "./types";
+
+/** Query vocabulary clearly implies this toolkit. */
+const TOOLKIT_HINT_BOOST = 1.5;
+/** ...so tools from other toolkits are demoted, or vocabulary collisions win. */
+const TOOLKIT_MISS_PENALTY = 0.6;
+
+/** Query implies a sub-app ("inbox" -> gmail, not calendar). */
+const FACET_HINT_BOOST = 1.4;
+/** Applied only within a toolkit that has a hinted facet. */
+const FACET_MISS_PENALTY = 0.7;
+
+/** Provider-flagged commonly-used tool. */
+const IMPORTANT_BOOST = 1.2;
+
+/** Query intent agrees / disagrees with the tool's read-write nature. */
+const ASPECT_MATCH = 1.25;
+const ASPECT_MISMATCH = 0.8;
+
+/** Deprecated tools still rank, but must never outrank a live equivalent. */
+const DEPRECATED_PENALTY = 0.5;
+
+/**
+ * Read vs write intent.
+ *
+ * Returns 'mixed' when the query implies both, and callers then apply no aspect
+ * pressure at all. This is a deliberate departure from the pre-work, where
+ * write intent simply dominated.
+ *
+ * The reason is hidden prerequisites. "read all the issues and make a sheet" is
+ * a write request whose *first* required tool is a read (list issues), same for
+ * "schedule a meeting with karan" (search contacts first). Letting write
+ * dominate would demote precisely the prerequisite the chain cannot start
+ * without — the router would rank the destination and hide the doorway.
+ */
+export function queryAspect(tokens: string[]): QueryAspect {
+  const read = tokens.some((t) => READ_VERBS.has(t));
+  const write = tokens.some((t) => WRITE_VERBS.has(t));
+  if (read && write) return "mixed";
+  if (write) return "write";
+  if (read) return "read";
+  return null;
+}
+
+/** Tool aspect from the provider's hint, falling back to the slug's verb. */
+export function toolAspect(tool: CompactTool): ToolAspect {
+  if (tool.readonly !== undefined) return tool.readonly ? "read" : "write";
+  return READ_SLUG_VERBS.some((v) => tool.slug.includes(`_${v}`)) ? "read" : "write";
+}
+
+/** Facets whose hint vocabulary appears in the query. */
+export function hintedFacets(tokens: Set<string>): Facet[] {
+  return FACETS.filter((f) => f.hints.some((h) => tokens.has(h)));
+}
+
+/**
+ * Toolkits the query implies: those named outright ("github"), plus those
+ * owning a hinted facet ("inbox" -> googlesuper).
+ */
+export function hintedToolkits(tokens: Set<string>, facets: Facet[], toolkits: string[]): Set<string> {
+  const hinted = new Set<string>(facets.map((f) => f.toolkit));
+  for (const toolkit of toolkits) {
+    if (tokens.has(toolkit)) hinted.add(toolkit);
+  }
+  return hinted;
+}
+
+/** True when any of the facet's markers appear in the tool's slug or tags. */
+function facetMatches(facet: Facet, tool: CompactTool): boolean {
+  const tokens = new Set([...tokenize(tool.slug), ...tool.tags.flatMap(tokenize)]);
+  return facet.markers.some((m) => tokens.has(m));
+}
+
+export interface BoostContext {
+  aspect: QueryAspect;
+  facets: Facet[];
+  toolkits: Set<string>;
+}
+
+/**
+ * Apply metadata boosts on top of the lexical score.
+ *
+ * Every adjustment appends a signal, so a ranking can always be explained
+ * rather than taken on faith.
+ */
+export function applyBoosts(hits: ScoredTool[], ctx: BoostContext): ScoredTool[] {
+  const facetToolkits = new Set(ctx.facets.map((f) => f.toolkit));
+
+  const boosted = hits.map((hit) => {
+    let score = hit.score;
+    const signals = [...hit.signals];
+    const tool = hit.tool;
+
+    // Toolkit affinity: "inbox" means googlesuper — lift it, demote the rest.
+    if (ctx.toolkits.size) {
+      if (ctx.toolkits.has(tool.toolkit)) {
+        score *= TOOLKIT_HINT_BOOST;
+        signals.push(`toolkit:${tool.toolkit} ×${TOOLKIT_HINT_BOOST}`);
+      } else {
+        score *= TOOLKIT_MISS_PENALTY;
+        signals.push(`toolkit:miss ×${TOOLKIT_MISS_PENALTY}`);
+      }
+    }
+
+    // Facet affinity, only among toolkits the query actually pointed at. Without
+    // this, googlesuper's 467 tools are one undifferentiated pool and "check my
+    // inbox" competes against every Drive and Sheets tool on equal footing.
+    if (facetToolkits.has(tool.toolkit)) {
+      const own = ctx.facets.filter((f) => f.toolkit === tool.toolkit);
+      const matched = own.filter((f) => facetMatches(f, tool));
+      if (matched.length) {
+        score *= FACET_HINT_BOOST;
+        signals.push(`facet:${matched.map((f) => f.id).join("+")} ×${FACET_HINT_BOOST}`);
+      } else {
+        score *= FACET_MISS_PENALTY;
+        signals.push(`facet:miss ×${FACET_MISS_PENALTY}`);
+      }
+    }
+
+    if (tool.important) {
+      score *= IMPORTANT_BOOST;
+      signals.push(`important ×${IMPORTANT_BOOST}`);
+    }
+
+    // 'mixed' intentionally applies no pressure — see queryAspect.
+    if (ctx.aspect === "read" || ctx.aspect === "write") {
+      const ta = toolAspect(tool);
+      const factor = ta === ctx.aspect ? ASPECT_MATCH : ASPECT_MISMATCH;
+      score *= factor;
+      signals.push(`aspect:${ctx.aspect}/${ta} ×${factor}`);
+    }
+
+    if (tool.deprecated) {
+      score *= DEPRECATED_PENALTY;
+      signals.push(`deprecated ×${DEPRECATED_PENALTY}`);
+    }
+
+    return { tool, score, signals };
+  });
+
+  boosted.sort((a, b) => b.score - a.score);
+  return boosted;
+}
