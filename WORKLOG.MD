@@ -1,6 +1,175 @@
 # Work Log
 
-_Updated: 2026-07-16, after progressive Drive resume export testing._
+_Updated: 2026-07-16, after fixing the stream-killed-mid-turn bug (prompt 1 through the UI)._
+
+## Fixed — prompt 1 froze in the UI: Bun's idle timeout was killing the stream mid-turn
+
+Reported as "stuck after ~70 emails". Not a triage or job-runner problem — the triage itself completes in ~11s when called directly (`reviewed=100`). The HTTP response was dying underneath it: **`Bun.serve` defaults to a 10s `idleTimeout`**, and a single tool execution that runs >10s with no stream writes (the triage is silent while it works) had its connection closed at exactly ~12s. Reproduced 3× (always 663 bytes, death at 12.0s), fixed, re-verified.
+
+- **`src/server.ts`** — `idleTimeout: 255` (Bun's max). Long *jobs* additionally stream progress, so a genuinely hung connection still dies — just not a healthy one that's merely quiet.
+- **`src/lib/email/triage.ts` + `src/lib/local/capabilities.ts`** — triage now reports progress through the same `JobProgress` shape the bulk jobs use (`discovering` per page → `transforming` → `done`), so the existing StepRows progress UI renders it with zero frontend changes, and the user sees pagination climbing instead of silence. Counts only — no subjects/senders/snippets in progress events. The registry entry threads `ctx.onProgress` through; `agent.ts` already forwarded it generically for any local capability.
+
+Deliberately **not** moved to the job runner: the runner's contract is source → transform → *sheet*; triage returns a digest and writes nothing. What it actually shared with jobs was the need for progress, which is now wired.
+
+### Verification
+- `bun test` — 181 pass / 0 fail; typecheck clean on touched files.
+- **Live, exact prompt 1 through HTTP** (previously died at 12.0s / 663 bytes): completes, exit 0, 7,410 bytes, digest of 8 with reasons; progress events observed `discovering 0 → 100 → transforming → done`. `idleTimeout` applied through `bun --hot` without a restart.
+
+## Fixed — the context guard failed on multi-array results (aliased GraphQL)
+
+Reported: repo stats worked, but "look at the issues" produced no content. The screenshot carried the smoking gun: `GITHUB_RUN_GRAPH_QL_QUERY` succeeded but **"Result shrunk 517,050 → 253,097 chars"** — the guard reported success while handing the model ~63k tokens, eight times the 32k-char budget.
+
+### Root cause
+
+The model, blocked by REST 503s, fell back to a GraphQL query aliasing open *and* closed issues — **two sibling `nodes[]` arrays**. `findRecordArray` (singular) compacted only the largest; the sibling rode into context whole. Reproduced hermetically: 504,774 → 252,389, `closedIssues` capped to 1 node while `openIssues` kept 100 full bodies.
+
+### Fix (`src/lib/compact.ts`)
+
+1. **`findRecordArrays`** — collects *every* array of objects (walk depth ≤ 6); pruning and capping now cover all of them. Capping trims the currently-largest list, re-measures, repeats — `omittedItems` accumulates across lists so nothing vanishes unaccounted for.
+2. **Containers are recursed into, not dropped.** `pruneFields` used to drop any field > 400 chars, including *objects* — which is how an email's `payload` lost its tiny `mimeType` along with the 16KB `raw`, and how the no-record-list path could hand the model `{}` ("finalChars=2"). Oversized objects now recurse (bound: depth 8) and shed only their bulk leaves. Contract shift: `droppedFields` now names the leaf (`raw`), not the container (`payload`); tests updated accordingly.
+3. **Unconditional backstop in `finish`**: if the structural passes still leave the result over budget (arrays nested past the walk depth, ten thousand small fields — shapes we haven't met yet), the result is truncated wholesale into `{successful, error?, truncated_preview, _note}`. Everything above is best-effort; this line is the actual guarantee.
+
+### Verification
+
+- Hermetic, all three failure shapes: aliased GraphQL **504,774 → 22,174** (both lists complete at 100 nodes, bodies gone, titles intact); flat 9,000-field object → backstop fires (17,338); depth-9 arrays → 81 chars. All ≤ 32,000.
+- `bun test` — **177 pass / 0 fail** (7 new: both-arrays-compacted, cross-array capping with count reconciliation, backstop firing, depth bound; 4 updated for the container-recursion contract).
+- **Live, the user's exact prompt** ("Look at the issues and tell me graphprotocol/graph-node"): REST 503s reported honestly → GraphQL fallback succeeds → the answer is a real table of 30 recent issues with titles/authors/dates/labels. This is the "content of issues" the user was missing.
+
+### Provider status (context, not ours)
+
+Composio→GitHub egress is now **flapping**: repo stats and GraphQL succeeded in the user's session; minutes later `GET_A_REPOSITORY` 500'd from here while GraphQL kept working. REST `LIST_REPOSITORY_ISSUES` still 503s consistently. Intermittent recovery of an outage, not a config issue — the earlier `proxyExecute` 503 evidence stands. GraphQL currently being the reliable path is luck, not design; the full-issue *export* (bulk job) still depends on the REST endpoint and stays blocked until it recovers.
+
+## Fixed — the attachment was lost the moment the agent asked a question
+
+Reported: "it is not able to find the attached file I am attaching to the chat."
+
+The server log told the whole story:
+
+| Turn | Attachment prepared? |
+|---|---|
+| "Send an email with the attached pdf" + PDF | **✓ uploaded `cv_Pranav_Maheshwari.pdf`** |
+| "test@gmail.com no subject . No body" (answering the agent) | **✗ none** |
+| "here pdf attachment" | **✗ none** |
+
+`extractAttachmentPayloads` read `experimental_attachments` off the **latest user message only**. The file uploads fine on the turn it is typed on — but the agent then correctly asks who to send it to, and the user's answer is a fresh message with no file on it. The attachment vanished, and the agent reported it could not find the file the user was looking straight at.
+
+Exactly the same shape as the routing bug fixed earlier this session: **the agent asks a question it then cannot understand the answer to.** Both came from treating one message as the whole request.
+
+The bytes were never actually gone: the file stays on its original message, and useChat re-sends the full history (that is how the UI keeps rendering the attachment chip). We simply were not looking past the newest message.
+
+- `extractAttachmentPayloads` now scans back over the last **3 user turns** and returns the newest message that carries attachments.
+- Bounded on purpose: carrying an attachment forever is its own bug — a PDF from ten turns ago must not silently ride along on an unrelated email. Three covers ask-and-answer with margin; staler than that, re-attach.
+- Newest wins (the scan stops at the first user turn with attachments), so re-attaching replaces rather than accumulates.
+
+### Verification
+
+- `bun test` — **173 pass / 0 fail** (4 new: the exact reported flow, staleness cutoff, newest-wins, assistant attachments ignored).
+- `bun run typecheck` — 0 errors from this change.
+- **Live, the exact reported flow**: attach → agent asks → answer with no file → `[attach] uploaded "cv_Pranav_Maheshwari.pdf" for GOOGLESUPER_SEND_EMAIL.attachment` → `[exec] → GOOGLESUPER_SEND_EMAIL args=recipient_email,subject,attachment [+attachment on attachment]` → sent.
+- **Verified the delivered email, not just the tool call**: fetched the sent message back — `attachmentList: [{filename: "cv_Pranav_Maheshwari.pdf", mimeType: "application/pdf"}]`, `multipart/mixed` in the MIME payload. The real PDF is really there.
+
+### Note for future debugging
+
+A first read of the sent message reported `attachments: NONE` and looked like a live "claims success but sends nothing" bug. It was a false alarm: the check used `include_payload:false, verbose:false`, which is exactly the metadata-only mode the triage path relies on — and it strips `attachmentList`. **Verify attachments with a payload-bearing fetch**, or the read lies.
+
+## Investigated — "Show open issues from composiohq/composio" fails
+
+Reported by screenshot. **The router was right** (1,362 tools → 15 candidates → 1 selected: `GITHUB_LIST_REPOSITORY_ISSUES`). Execution failed with 110KB of HTML.
+
+### Not our bug: Composio's egress to GitHub is returning 503
+
+The HTML is GitHub's `Unicorn! · GitHub` error page — "No server is currently available to service your request."
+
+**Decisive evidence (2026-07-16 ~23:10):** `composio.tools.proxyExecute({endpoint:"/user", method:"GET", connectedAccountId})` — a raw GitHub API call through Composio's stored OAuth token, bypassing their tool definitions entirely — returns **HTTP 503** with the same page. So this is neither our arguments, nor the tool schema, nor the connected account: **Composio's server-to-GitHub egress is failing**, and their tool layer is merely relaying it.
+
+Also ruled out at the same moment: `facebook/react` fails identically (not repo-specific); GitHub's API is healthy from this machine (`/user` → 401 as expected without a token, issues → 200, rate limit 53/60); the OAuth connection is ACTIVE. The user's "GitHub connectivity is working" is true at the OAuth layer — it is execution that 503s.
+
+| Check | Result |
+|---|---|
+| `api.github.com` direct, unauthenticated | **200, real JSON** |
+| githubstatus.com | **All systems operational**, no incidents |
+| Every Composio github tool, incl. `GET_THE_AUTHENTICATED_USER` | **500 Unicorn HTML** |
+| All 3 ACTIVE github connected accounts, tested individually | **all fail identically** |
+| 4 retries over ~30s | **consistent, never transient**, ~5s each |
+| Same tool ~40 min earlier | **worked — exported all 661 issues** |
+| googlesuper tools, same moment | **working** |
+
+Not the arguments (every shape fails, including the one that exported 661 issues), not the account (all three fail), not GitHub's public API, not our code. It is Composio-side, and it was still failing at the end of this session. **Nothing to fix here — but two real bugs of ours were only visible because of it.**
+
+### Fixed 1 — the context guard threw away the error (`src/lib/compact.ts`)
+
+The screenshot says it outright: *"Result shrunk 110,486 → 47 chars before the model saw it (dropped: data, error)"*. `compactToolResult` treats any oversized field as noise, so it dropped `error` — and the model, handed 47 characters of nothing, **invented three plausible causes** ("repository not found or private / rate limiting / network issues"), none of them true. On a failed call the error is the one field that must survive.
+
+- `PRESERVED_FIELDS` (`error`, `message`, `successful`, `status`, `statusCode`) are now **shortened, never dropped**. This is the one deliberate exception to "key off size, not names", and it is documented as such: an oversized body is noise, an oversized error is the whole story.
+- `condense()` handles HTML specially — a provider error arrives as a whole error *page*, and the `<title>` says more than 300 chars of doctype and inline CSS. It extracts the title, strips markup, and labels it a provider-side failure.
+- The note now distinguishes "removed" from "shortened, not removed — report what they say rather than speculating".
+- **Ordering bug caught by its own test**: `condensePreservedInPlace` originally ran *after* the item cap, so a 110KB error kept the result over budget and the cap threw away good records (5 → 1) trying to reclaim space the error was occupying. Preserved fields are now shortened *first*.
+
+Live, on the real failure: **110,486 → 388 chars**, error preserved and readable. The user-facing answer went from three fabricated causes to: *"GitHub is currently experiencing an issue (showing a 'Unicorn!' error page). This is a temporary server-side problem on GitHub's end."*
+
+### Fixed 2 — the bulk path would have blamed the wrong thing (`src/lib/jobs/runner.ts`)
+
+`describeDiscoveryFailure` guesses "the account may not be connected" from keywords, and a 500 HTML page can contain any word — so a connected account plus a provider outage would have sent the user to re-authenticate something that was already fine. It now checks for an HTML body *first* and reuses `condense`, so the bulk path reports the provider outage instead of a wrong fix. The auth case still works.
+
+### Verification
+
+- `bun test` — **170 pass / 0 fail** (6 new: error shortened not dropped, title/text kept, markup stripped, provider-side labelling, non-HTML truncation, records survive alongside a huge error).
+- `bun run typecheck` — 0 errors from this change.
+
+### Open
+
+- **GitHub via Composio is still down as of the end of this session.** Prompt 3 and the GitHub bulk export cannot run until it recovers; both were verified working earlier (661/661 issues), so re-run to confirm once it does.
+- **4 github + 6 googlesuper connected accounts** now exist for user `candidate`. Not the cause here (all were tested individually), but worth pruning — Composio raises `ComposioMultipleConnectedAccountsError` on some paths.
+
+## Completed — job concurrency tuning (measured, not guessed)
+
+The 1,000-resume export took 11m 34s. Profiled per stage over 6 live files: download 1,959ms (59%) + model call 1,309ms (40%) + PDF parse 35ms (1%). The pipeline is I/O-bound — 1,000 × 3.3s ÷ concurrency 5 = 660s predicted vs 693s observed, so the concurrency cap alone explains the runtime. Ladder at higher settings (100 files): 5→72s, 20→23.5s, 40→14.3s, 80→12.1s — zero failures, zero rate-limit retries at every level.
+
+- **`src/lib/jobs/registry.ts`** — presets can now carry a *measured* `concurrency`; `drive_resumes` is set to 20 (~12 req/s, well inside Composio's advertised 2,000/60s). `github_issues` deliberately has none — untested above 5, so it keeps the engine default. `resolveConcurrency` encodes the precedence: explicit caller > `JOB_CONCURRENCY` env > preset > engine default (5). Garbage env values (non-integer, ≤0) are ignored, not treated as 0.
+- **Retry visibility** — every `withRetry` site now counts into `JobResult.stats`: `transform_retries` (runner), `sheet_append_retries` (SheetWriter, which now takes the job's stats), `page_retries` (both sources). A run that survived on backoff no longer looks identical to one that never blipped; empty stats now positively means a clean run.
+
+### Verification
+- `bun test` — 164 pass / 0 fail (5 new: retry counters ×3, clean-run-has-no-counters, resolveConcurrency precedence).
+- Live: 25 files 19s→12.6s; env override honored (`JOB_CONCURRENCY=5` → 21.2s, matching the old default); 100 files 72s→21.2s, 100/100, zero retries.
+- Full 1,000 re-run at concurrency 20: see below (in flight at write time).
+
+### Known problem (pre-existing, found during coupling check)
+`GITHUB_LIST_REPOSITORY_ISSUES` currently fails with a GitHub HTML error page — reproduced with a **direct `executeTool` call bypassing all job code**, and `getConnectionStatus` shows the GitHub account ACTIVE. Upstream (GitHub/Composio) transient, unrelated to this change; retest before the GitHub bulk ladder.
+
+## Fixed — the agent could not understand the answer to its own question
+
+Reported by screenshot: "Schedule a meeting with Karan tomorrow" → the agent correctly asks for the time → user answers "10 am and 30 mins" → **"An error occurred."**
+
+Two independent bugs, both reproduced before changing anything.
+
+### 1. Routing ignored the conversation (`src/lib/router/select.ts`)
+
+The router only ever saw the newest message. So the agent asks "what time?" — exactly what CLAUDE.md tells it to do when a required value is missing — and then cannot route the reply, because "10 am and 30 mins" contains no calendar vocabulary. Measured: it scored **2.4** against junk tools, never saw `CREATE_EVENT`, and called `FIND_FREE_SLOTS` instead — reporting a "conflict" rather than scheduling anything. Worse, `"10am"`, `"yes"`, `"thanks"`, `"sure"` and `"ok go ahead"` matched **zero** of 1,360 tools, and `runTurn` *threw* on zero → HTTP 500 → the UI's only possible rendering was "An error occurred."
+
+- `extractRequest` now also returns earlier user turns (`context`, most recent first, window 3).
+- `routeWithContext` routes the latest message; **only if** its best candidate scores below `MIN_STANDALONE_SCORE` does it retry with earlier turns folded in, and it keeps that result only if it genuinely scored better.
+- The threshold (15) is measured, not guessed: real standalone requests score **23.6–108** (weakest: "Schedule a meeting with Karan tomorrow" at 23.6, since "karan" is unknown vocabulary); continuations and chit-chat score **0–10.8** (strongest: "make it 45 minutes"). 15 sits in the gap.
+- Conditional by design: always merging turns would let a finished task steer the next request. A message that routes well alone is untouched, so this can only help a request that was already failing — verified: single-turn prompts and topic switches still report `usedContext=false` and identical rankings.
+- `runTurn` no longer throws on zero tools. A turn with no tools is *normal* ("thanks", or an answer to a question we asked); the model now replies conversationally with no tools, and the system prompt says so plainly instead of presenting an empty tool list.
+
+### 2. Contact seeding was silently disabled (`src/lib/router/scoring.ts`, `router.ts`)
+
+With routing fixed, the agent still said "I don't have access to your contacts": `impliesPerson` was `true` and `bestFacetTool` returned `SEARCH_PEOPLE`, yet **no contacts tool was in the candidates — for the plain single-turn prompt 2 either.** The prerequisite mechanism had never worked.
+
+Cause: the "is a contacts tool already present?" gate used `facetMatches`, which reads the **description**. `GOOGLESUPER_LIST_CALENDAR_RESOURCES` — a tool for listing **conference rooms** — satisfies the contacts facet because its prose cites the "Admin SDK **Directory** API" and the word "person". One false positive convinced the router a contacts tool was present and skipped seeding entirely.
+
+This was my own bug meeting someone else's code: description matching is right for *scoring* (a loose hint earns a 1.4× nudge; a wrong guess costs little) and wrong for any yes/no *gate*, where a single false positive disables a whole mechanism. Added `facetMatchesStrict` (slug + tags only) for decisions; `facetMatches` stays for scoring. The distinction is now documented at both call sites.
+
+### Verification
+
+- `bun test` — **161 pass / 0 fail** (9 new in `select.test.ts`: the exact failing conversation, the bare-time case, standalone-unaffected, topic-switch-unpolluted, honest-empty).
+- `bun run typecheck` — 0 errors from this change.
+- **Live, the exact screenshot conversation**: HTTP **200**, routes with context → `SEARCH_PEOPLE` + `CREATE_EVENT` offered → model calls `SEARCH_PEOPLE("Karan")` → no such contact in this account → asks for the address. Correct per CLAUDE.md: searched first, invented nothing, asked once.
+- Contacts tool now survives for all three phrasings of prompt 2, including the assignment's own wording.
+
+### Note
+
+`"thanks"` also picks up the previous task's tools now. Deliberate: a short reply is far more often a continuation needing those tools ("yes", "ok go ahead", "10am") than a sign-off, and *offering* a tool costs nothing — the model still decides whether to call it.
 
 ## Completed — Drive resume bulk export (prompt 4, full progressive ladder)
 
