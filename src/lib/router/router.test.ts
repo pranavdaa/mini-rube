@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeAll } from "bun:test";
 import { Router } from "./router";
 import { LexicalIndex, tokenize } from "./lexical";
-import { queryAspect, toolAspect } from "./scoring";
+import { queryAspect, toolAspect, impliesUnresolvedPerson } from "./scoring";
 import { normalizeTool } from "./normalize";
 import { fetchCatalog, TOOLKITS } from "./catalog";
 import type { CompactTool } from "./types";
@@ -85,6 +85,39 @@ describe("query aspect", () => {
   it("falls back to the slug verb when the provider gives no read/write hint", () => {
     expect(toolAspect(tool({ slug: "GITHUB_LIST_ISSUES", toolkit: "github" }))).toBe("read");
     expect(toolAspect(tool({ slug: "GITHUB_CREATE_ISSUE", toolkit: "github" }))).toBe("write");
+  });
+});
+
+describe("impliesUnresolvedPerson", () => {
+  // A stand-in for the catalog's own vocabulary: only words this fixture's
+  // tools actually use are "known" — everything else (a name like "karan")
+  // is not, regardless of any fixed word list.
+  const index = new LexicalIndex(FIXTURE);
+  const isKnownTerm = (t: string) => index.hasTerm(t);
+
+  it("flags an unknown word after a person preposition", () => {
+    expect(impliesUnresolvedPerson("schedule a calendar event tomorrow with karan", isKnownTerm)).toBe(true);
+  });
+
+  it("flags 'invite <name>' directly", () => {
+    expect(impliesUnresolvedPerson("invite karan to the sync", isKnownTerm)).toBe(true);
+  });
+
+  it("does not flag a stopword following the preposition", () => {
+    expect(impliesUnresolvedPerson("schedule a meeting with a saved contact", isKnownTerm)).toBe(false);
+  });
+
+  it("does not flag relative-time vocabulary following the preposition", () => {
+    expect(impliesUnresolvedPerson("create an event for tomorrow", isKnownTerm)).toBe(false);
+  });
+
+  it("does not flag real catalog vocabulary the fixture actually indexes", () => {
+    // "email" is genuine vocabulary for this fixture (GOOGLESUPER_SEND_EMAIL).
+    expect(impliesUnresolvedPerson("send this to email", isKnownTerm)).toBe(false);
+  });
+
+  it("returns false when no person preposition appears at all", () => {
+    expect(impliesUnresolvedPerson("read recent emails", isKnownTerm)).toBe(false);
   });
 });
 
@@ -216,6 +249,26 @@ describe("routing over the live catalog", () => {
     expect(slugs).toContain("GOOGLESUPER_CREATE_EVENT");
     // The hidden prerequisite: you cannot invite someone you haven't resolved.
     expect(slugs.some((s) => s === "GOOGLESUPER_SEARCH_PEOPLE" || s === "GOOGLESUPER_GET_CONTACTS")).toBe(true);
+  });
+
+  it("routes: schedule a calendar event tomorrow with karan (unresolved-name prerequisite)", () => {
+    // The assignment's own wording. Unlike "with a saved contact" above, no
+    // catalog vocabulary names a person here — "karan" scores zero against
+    // every tool — so this only passes via the position-based seeding in
+    // router.ts (impliesUnresolvedPerson / bestFacetTool), not lexical overlap.
+    const routed = router.search("schedule a calendar event tomorrow with karan");
+    const slugs = routed.candidates.map((c) => c.slug);
+    expect(routed.parsed.impliesPerson).toBe(true);
+    expect(slugs).toContain("GOOGLESUPER_CREATE_EVENT");
+    expect(slugs.some((s) => s === "GOOGLESUPER_SEARCH_PEOPLE" || s === "GOOGLESUPER_GET_CONTACTS")).toBe(true);
+  });
+
+  it("does not falsely flag catalog vocabulary as a person's name", () => {
+    // "with subject" ("send an email to me with subject X") must not be read
+    // as "with <name>" — "subject" is real catalog vocabulary (an input field
+    // on GOOGLESUPER_SEND_EMAIL), just not part of this query's top matches.
+    const routed = router.search("send an email to me with subject Router Test");
+    expect(routed.parsed.impliesPerson).toBe(false);
   });
 
   it("routes: list all repository issues", () => {

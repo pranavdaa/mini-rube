@@ -1,4 +1,5 @@
 import { composio } from "../composio";
+import { getLocalCapability, isLocalSlug } from "../local/capabilities";
 
 /**
  * Lazy full-schema loading.
@@ -22,9 +23,14 @@ const cache = new Map<string, FullTool>();
 /**
  * Fetch full schemas for the given slugs in a single catalog call, reusing
  * anything already seen this process.
+ *
+ * Local capabilities (see lib/local/capabilities.ts) aren't Composio tools —
+ * they carry their own JSON Schema — so they're synthesized directly and
+ * excluded from the Composio fetch entirely.
  */
 export async function loadToolSchemas(slugs: string[]): Promise<Map<string, FullTool>> {
-  const missing = slugs.filter((s) => !cache.has(s));
+  const composioSlugs = slugs.filter((s) => !isLocalSlug(s));
+  const missing = composioSlugs.filter((s) => !cache.has(s));
 
   if (missing.length) {
     const res: any = await composio.tools.getRawComposioTools({ tools: missing } as any);
@@ -37,6 +43,11 @@ export async function loadToolSchemas(slugs: string[]): Promise<Map<string, Full
 
   const out = new Map<string, FullTool>();
   for (const slug of slugs) {
+    if (isLocalSlug(slug)) {
+      const cap = getLocalCapability(slug)!;
+      out.set(slug, { slug: cap.slug, description: cap.description, inputParameters: cap.inputSchema, version: "local" });
+      continue;
+    }
     const tool = cache.get(slug);
     if (tool) out.set(slug, tool);
   }

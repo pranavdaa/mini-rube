@@ -1,5 +1,6 @@
 import { createSheet, SheetWriter } from "./sheets";
 import { withRetry } from "./retry";
+import { condense } from "../compact";
 import type { JobConfig, JobContext, JobProgress, JobResult, JobStats, TransformOutcome } from "./types";
 
 /**
@@ -63,10 +64,20 @@ export async function runJob<T>(config: JobConfig<T>): Promise<JobResult> {
   // we cannot honour "every item gets a row", and a half-listed export is worse
   // than none. Fail with a message that says what to do, not a provider stack
   // trace — the most common cause by far is a toolkit that isn't connected.
+  // Discovery dedupes by the source's own item id: the same item seen twice is
+  // one input, not two rows — a Drive shortcut must not double-count a resume,
+  // and a source that *re-discovers* items must be harmless. That last property
+  // is load-bearing: it is what lets the GitHub source restart discovery over
+  // GraphQL when Composio's REST egress dies mid-pagination — the re-yielded
+  // prefix drops out here and only the genuinely new remainder appends.
   const items: T[] = [];
+  const discovered = new Set<string>();
   try {
     for await (const page of source.pages(ctx, { pageSize })) {
       for (const item of page) {
+        const id = source.identify(item).id;
+        if (discovered.has(id)) continue;
+        discovered.add(id);
         items.push(item);
         if (maxItems && items.length >= maxItems) break;
       }
@@ -105,7 +116,7 @@ export async function runJob<T>(config: JobConfig<T>): Promise<JobResult> {
   report();
 
   const handle = await createSheet(ctx.userId, sheetTitle);
-  const writer = new SheetWriter(ctx.userId, handle, appendBatchSize, ctx.signal);
+  const writer = new SheetWriter(ctx.userId, handle, appendBatchSize, ctx.signal, stats);
   progress.outputUrl = handle.url;
 
   const headers = [...transform.columns, source.sourceColumn, "Status"];
@@ -232,8 +243,12 @@ async function runBatch<T>(
   try {
     const outcomes = await withRetry(() => transform.run(batch, ctx), {
       signal: ctx.signal,
-      onRetry: (attempt, delay, err) =>
-        console.warn(`[job] ${transform.id} batch retry ${attempt} in ${delay}ms: ${err.message}`),
+      onRetry: (attempt, delay, err) => {
+        // Count every retry into the job result: a run that survived on
+        // backoff should say so, not look identical to one that never blipped.
+        if (ctx.stats) ctx.stats.transform_retries = (ctx.stats.transform_retries ?? 0) + 1;
+        console.warn(`[job] ${transform.id} batch retry ${attempt} in ${delay}ms: ${err.message}`);
+      },
     });
 
     // A transform that returns the wrong arity would silently misalign rows
@@ -260,6 +275,14 @@ async function runBatch<T>(
 export function describeDiscoveryFailure(sourceId: string, ref: string, err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
   const toolkit = sourceId.startsWith("github") ? "GitHub" : "Google";
+
+  // An HTML body means the provider handed back an error *page* — its own
+  // outage, not our request. Check this before the auth guess below: a 500 page
+  // can mention any word, and telling the user to reconnect an account that is
+  // already connected sends them fixing the wrong thing.
+  if (/<html[\s>]|<!doctype html/i.test(raw)) {
+    return `Could not read ${ref}: ${condense(raw)}`;
+  }
 
   if (/executing the tool|401|403|unauthorized|forbidden|invalid[_ ]grant|expired/i.test(raw)) {
     return (

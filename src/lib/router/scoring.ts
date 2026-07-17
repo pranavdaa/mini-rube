@@ -1,5 +1,15 @@
-import { FACETS, READ_VERBS, WRITE_VERBS, READ_SLUG_VERBS, type Facet } from "./aliases";
+import {
+  FACETS,
+  READ_VERBS,
+  WRITE_VERBS,
+  READ_SLUG_VERBS,
+  PERSON_PREPOSITIONS,
+  TIME_WORDS,
+  STOPWORDS,
+  type Facet,
+} from "./aliases";
 import { tokenize } from "./lexical";
+import { LOCAL_TOOLKIT } from "./types";
 import type { CompactTool, QueryAspect, ScoredTool, ToolAspect } from "./types";
 
 /** Query vocabulary clearly implies this toolkit. */
@@ -11,6 +21,17 @@ const TOOLKIT_MISS_PENALTY = 0.6;
 const FACET_HINT_BOOST = 1.4;
 /** Applied only within a toolkit that has a hinted facet. */
 const FACET_MISS_PENALTY = 0.7;
+
+/**
+ * Facet boost for local capabilities — deliberately smaller than
+ * FACET_HINT_BOOST. At the full 1.4, TRIAGE_IMPORTANT_EMAILS (whose tags carry
+ * the whole gmail facet vocabulary) tied FETCH_EMAILS at the top for a plain
+ * "show my five most recent emails" — a request whose *outcome* it does not
+ * produce. 1.2 is enough to keep a matching capability inside the top-15 pool
+ * for stage 2 to consider, without letting it eclipse the plain tool that is
+ * actually asked for.
+ */
+const LOCAL_FACET_BOOST = 1.2;
 
 /** Provider-flagged commonly-used tool. */
 const IMPORTANT_BOOST = 1.2;
@@ -121,9 +142,83 @@ function facetText(tool: CompactTool): Set<string> {
   return tokens;
 }
 
-function facetMatches(facet: Facet, tool: CompactTool): boolean {
+/**
+ * Strict membership: does this tool *belong to* the facet, by its own name and
+ * tags — ignoring prose?
+ *
+ * `facetMatches` reads the description too, which is right for scoring (a loose
+ * hint is worth a 1.4x nudge and a wrong guess costs little) but wrong for any
+ * yes/no gate. GOOGLESUPER_LIST_CALENDAR_RESOURCES — a tool for listing
+ * conference rooms — matches the contacts facet on description alone, because
+ * its prose mentions the "Admin SDK Directory API" and the word "person". Used
+ * as a gate, that one false positive convinced the router a contacts tool was
+ * already present and silently disabled contact seeding entirely, so
+ * "schedule a meeting with karan" never got a way to resolve karan.
+ *
+ * Use this for decisions. Use facetMatches for scoring.
+ */
+export function facetMatchesStrict(facet: Facet, tool: CompactTool): boolean {
+  const tokens = new Set([...tokenize(tool.slug), ...tool.tags.flatMap(tokenize)]);
+  return facet.markers.some((m) => tokens.has(m));
+}
+
+export function facetMatches(facet: Facet, tool: CompactTool): boolean {
   const tokens = facetText(tool);
   return facet.markers.some((m) => tokens.has(m));
+}
+
+/**
+ * True when a person-referring preposition ("with", "invite", ...) is followed
+ * by a word the catalog's own vocabulary doesn't know.
+ *
+ * Lexical retrieval only ever surfaces tools sharing vocabulary with the
+ * query, so a proper noun like "karan" scores zero against every tool and the
+ * contacts prerequisite for "schedule a calendar event tomorrow with karan"
+ * never appears in the candidate list — confirmed against the live catalog.
+ * This catches the *position* instead of the word: an unrecognized token right
+ * after "with"/"to"/"invite" implies a name, which implies a contact lookup is
+ * needed to resolve it to a real address before anything can be created.
+ *
+ * `isKnownTerm` is the catalog's own vocabulary (via LexicalIndex.hasTerm), not
+ * a fixed word list — so "subject" in "email to me with subject X" is
+ * correctly recognized as catalog vocabulary (a real input field) and not
+ * mistaken for a person, with no per-field hardcoding.
+ */
+export function impliesUnresolvedPerson(rawQuery: string, isKnownTerm: (token: string) => boolean): boolean {
+  const words = rawQuery
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  for (let i = 0; i < words.length - 1; i++) {
+    if (!PERSON_PREPOSITIONS.has(words[i]!)) continue;
+    const next = words[i + 1]!;
+    if (next.length < 2 || /^\d+$/.test(next)) continue;
+    if (STOPWORDS.has(next) || TIME_WORDS.has(next)) continue;
+    if (isKnownTerm(next)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Best tool for a facet, even when nothing in it shares vocabulary with the
+ * query — used to seed the contacts prerequisite by position rather than
+ * lexical overlap. Prefers a search/query-style tool (can filter by name) over
+ * a plain enumerate-everything tool, since resolving one named person is what
+ * the caller needs.
+ */
+export function bestFacetTool(tools: readonly CompactTool[], facet: Facet): CompactTool | undefined {
+  const matches = tools.filter((t) => t.toolkit === facet.toolkit && facetMatches(facet, t));
+  if (!matches.length) return undefined;
+
+  const searchLike = matches.filter((t) => /SEARCH|FIND|QUERY/.test(t.slug));
+  const pool = searchLike.length ? searchLike : matches;
+
+  return [...pool].sort(
+    (a, b) => Number(b.important) - Number(a.important) || a.slug.localeCompare(b.slug)
+  )[0];
 }
 
 export interface BoostContext {
@@ -147,7 +242,13 @@ export function applyBoosts(hits: ScoredTool[], ctx: BoostContext): ScoredTool[]
     const tool = hit.tool;
 
     // Toolkit affinity: "inbox" means googlesuper — lift it, demote the rest.
-    if (ctx.toolkits.size) {
+    // Local capabilities (see lib/local/capabilities.ts) aren't tied to any one
+    // toolkit's vocabulary — a triage capability over Gmail data isn't itself
+    // "googlesuper" vocabulary — so they're exempt rather than penalized for
+    // "missing" a toolkit hint.
+    if (ctx.toolkits.size && tool.toolkit === LOCAL_TOOLKIT) {
+      signals.push("toolkit:local (exempt)");
+    } else if (ctx.toolkits.size) {
       if (ctx.toolkits.has(tool.toolkit)) {
         score *= TOOLKIT_HINT_BOOST;
         signals.push(`toolkit:${tool.toolkit} ×${TOOLKIT_HINT_BOOST}`);
@@ -169,6 +270,21 @@ export function applyBoosts(hits: ScoredTool[], ctx: BoostContext): ScoredTool[]
       } else {
         score *= FACET_MISS_PENALTY;
         signals.push(`facet:miss ×${FACET_MISS_PENALTY}`);
+      }
+    } else if (tool.toolkit === LOCAL_TOOLKIT && ctx.facets.length) {
+      // Local capabilities span toolkits, so they can't ride the per-toolkit
+      // facet block above — and merely *exempting* them from penalties made
+      // them second-class whenever facets were hinted: every real tool earned
+      // up to ×2.1 (toolkit × facet) while a local capability earned ×1. Seen
+      // live: EXPORT_TO_GOOGLE_SHEET ranked #18 for the assignment's own
+      // "all the issues → google sheet" prompt, so the model hand-rolled the
+      // export with raw tools and pulled the failure into chat. Let a local
+      // tool earn the facet boost on its own tags (strict match — no prose);
+      // no miss penalty, same reasoning as the toolkit exemption.
+      const matched = ctx.facets.filter((f) => facetMatchesStrict(f, tool));
+      if (matched.length) {
+        score *= LOCAL_FACET_BOOST;
+        signals.push(`facet:${matched.map((f) => f.id).join("+")} (local) ×${LOCAL_FACET_BOOST}`);
       }
     }
 

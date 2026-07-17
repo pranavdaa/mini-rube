@@ -2,6 +2,32 @@
 
 _Updated: 2026-07-16, after fixing the stream-killed-mid-turn bug (prompt 1 through the UI)._
 
+## Fixed — prompt 3 through chat: the export capability was invisible, then unchosen, then fragile
+
+Reported: "still getting the same issue" on the sheet-export prompt. The compaction fix *was* live; the log showed a different failure chain — three layers, each fixed and verified.
+
+### 1. `EXPORT_TO_GOOGLE_SHEET` never reached stage 2 (`scoring.ts`)
+
+For the assignment's own prompt 3 wording it ranked **#18** (cutoff #15). The signals showed why: `toolkit:local (exempt)` — the local-toolkit exemption spared it the miss *penalty* but denied it the toolkit (×1.5) and facet (×1.4) *boosts*, so real tools ran up to ×2.1 over it whenever facets were hinted. The model therefore hand-rolled the export with raw tools (created an empty sheet, then REST 503). Fix: local capabilities earn a facet boost on their own tags (strict matching, no prose). Tuned to **×1.2**, not the full 1.4 — at 1.4, TRIAGE (whose tags carry the gmail facet vocabulary) tied FETCH_EMAILS for a plain "show my five most recent emails", a request whose outcome it does not produce. Result: EXPORT #18→#2 (issues), #1 (resumes); TRIAGE #1 for the important-emails prompt; no regressions in the 10-case sweep (the karan SEARCH_PEOPLE #15 is the seeded slot, by construction).
+
+### 2. Stage 2 decomposed instead of delegating (`confirm.ts`, `agent.ts`)
+
+With EXPORT visible at #2, gpt-4o-mini still picked LIST + CREATE_SHEET — the prompt's own prerequisite examples ("adding rows needs the spreadsheet created first") teach exactly that decomposition. Added a whole-workflow-first rule: if one candidate produces the exact *outcome* end to end, select it alone; outcome must match, not topic (triage answers "which matter?", wrong for "show latest N" — with a concrete example pair, needed because the first wording regressed "show my five most recent" to TRIAGE). Stage 2 still sometimes hedges (EXPORT + raw tools together), so the agent system prompt got the execution-layer rule: one whole-workflow call, not a hand-built pipeline. Verified: kimi calls EXPORT.
+
+### 3. The REST outage flaps mid-run — GraphQL fallback + discovery dedupe (`sources/github-issues.ts`, `runner.ts`)
+
+Composio's REST egress kept flapping: a full export died mid-pagination *after* a healthy first page. Two changes: (a) the GitHub source falls back to GraphQL cursor pagination whenever REST dies with a provider error page — first page or mid-run — via `GITHUB_RUN_GRAPH_QL_QUERY` (verified live standalone; note GraphQL's `issues` connection excludes PRs natively); (b) **the runner now dedupes discovery by item id**, which is what makes a mid-run restart safe (the re-yielded prefix drops out). This is a deliberate contract change: same id = same input item = one row — a Drive shortcut must not double-count a resume. The old "every occurrence gets a row" test updated accordingly.
+
+### Verification
+
+- `bun test` — **183 pass / 0 fail** (fallback wiring proven deterministically: REST throws Unicorn → GraphQL paginates by cursor → stats recorded, states normalized; mid-run flap covered; discovery-dedupe covered).
+- **Full export, live: 661/661 issues, 662 rows, 0 failures, 111s** (REST held this run; 3,776 fetched / 3,115 PRs excluded / 38 pages; breakdown 31 open / 630 closed).
+- **Prompt 3 through chat, live**: agent calls `EXPORT_TO_GOOGLE_SHEET` → `[job] done 661/661 written=662` → answer reports counts + sheet link. Bulk data never entered context.
+
+### Note
+
+Stage-2 outcomes are a cheap nondeterministic model's judgment; the hedge (EXPORT alongside raw tools) recurs run to run. The layered design absorbs it: stage 1 guarantees visibility, stage 2 usually narrows, the agent rule + tool descriptions decide correctly at execution. Selection-quality checks live in the eval harness, not unit tests.
+
 ## Fixed — prompt 1 froze in the UI: Bun's idle timeout was killing the stream mid-turn
 
 Reported as "stuck after ~70 emails". Not a triage or job-runner problem — the triage itself completes in ~11s when called directly (`reviewed=100`). The HTTP response was dying underneath it: **`Bun.serve` defaults to a 10s `idleTimeout`**, and a single tool execution that runs >10s with no stream writes (the triage is silent while it works) had its connection closed at exactly ~12s. Reproduced 3× (always 663 bytes, death at 12.0s), fixed, re-verified.

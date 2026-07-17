@@ -1,7 +1,18 @@
-import { loadCatalog, TOOLKITS, catalogCounts } from "./catalog";
+import { loadCatalog, TOOLKITS, catalogCounts, catalogVersion } from "./catalog";
 import { LexicalIndex } from "./lexical";
-import { applyBoosts, hintedFacets, hintedToolkits, queryAspect } from "./scoring";
+import { FACETS } from "./aliases";
+import {
+  applyBoosts,
+  bestFacetTool,
+  facetMatchesStrict,
+  hintedFacets,
+  hintedToolkits,
+  impliesUnresolvedPerson,
+  queryAspect,
+} from "./scoring";
 import type { CompactTool, RouteResult, RouterCandidate, ScoredTool } from "./types";
+
+const CONTACTS_FACET = FACETS.find((f) => f.id === "contacts")!;
 
 /**
  * Candidates returned per query. Stage 1 is deliberately generous: it is a
@@ -41,6 +52,13 @@ export class Router {
     return this.tools;
   }
 
+  /** Content fingerprint of the indexed catalog; keys caches. Computed once. */
+  get version(): string {
+    this.cachedVersion ??= catalogVersion(this.tools);
+    return this.cachedVersion;
+  }
+  private cachedVersion?: string;
+
   /** Compact metadata for one slug. Full schemas are loaded elsewhere, lazily. */
   getTool(slug: string): CompactTool | undefined {
     return this.bySlug.get(slug);
@@ -51,11 +69,49 @@ export class Router {
     const { hits, parse } = this.index.search(query);
 
     const tokens = new Set(parse.baseTerms);
-    const facets = hintedFacets(tokens);
+    let facets = hintedFacets(tokens);
+
+    // "schedule ... with karan": no catalog vocabulary names a person, so
+    // lexical retrieval alone never nominates a contacts tool (verified against
+    // the live catalog — see WORKLOG). Detect the position instead of the word.
+    const personImplied = impliesUnresolvedPerson(query, (t) => this.index.hasTerm(t));
+    if (personImplied && !facets.includes(CONTACTS_FACET)) {
+      facets = [...facets, CONTACTS_FACET];
+    }
+
     const toolkits = hintedToolkits(tokens, facets, this.toolkits);
     const aspect = queryAspect(parse.baseTerms, query);
 
     const ranked = applyBoosts(hits, { aspect, facets, toolkits });
+    let candidates = ranked.slice(0, limit).map(toCandidate);
+
+    // The contacts tool may still be entirely absent from `ranked`: it shares
+    // zero vocabulary with the query, so the lexical stage never scored it
+    // above zero and it was filtered out before boosts ever ran. Seed it by
+    // position, not lexical overlap — a hidden prerequisite must survive the
+    // cut even when nothing points at it lexically.
+    if (personImplied) {
+      // Strict: by slug/tags, never prose. A description-level match here
+      // (e.g. a conference-room tool citing the "Directory API") reads as "we
+      // already have a contacts tool" and silently disables the seeding below.
+      const present = candidates.some((c) => {
+        const tool = this.bySlug.get(c.slug);
+        return tool && facetMatchesStrict(CONTACTS_FACET, tool);
+      });
+      if (!present) {
+        const seed = bestFacetTool(this.tools, CONTACTS_FACET);
+        if (seed) {
+          candidates = [
+            ...candidates.slice(0, Math.max(0, limit - 1)),
+            toCandidate({
+              tool: seed,
+              score: 0,
+              signals: ["seeded:contacts — unresolved name implies a contact lookup"],
+            }),
+          ];
+        }
+      }
+    }
 
     return {
       query,
@@ -66,8 +122,9 @@ export class Router {
         aspect,
         hintedToolkits: [...toolkits],
         hintedFacets: facets.map((f) => f.id),
+        impliesPerson: personImplied,
       },
-      candidates: ranked.slice(0, limit).map(toCandidate),
+      candidates,
       searched: this.index.size,
     };
   }

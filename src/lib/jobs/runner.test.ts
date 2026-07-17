@@ -29,6 +29,7 @@ mock.module("../tools", () => ({
 }));
 
 const { runJob } = await import("./runner");
+const { resolveConcurrency, JOB_PRESETS } = await import("./registry");
 import type { Source, Transform } from "./types";
 
 interface Item {
@@ -142,9 +143,29 @@ describe("runJob", () => {
     });
 
     expect(seen).toEqual([1, 2]); // downloaded/extracted once each, not four times
-    expect(res.processed).toBe(4);
-    expect(res.rowsWritten).toBe(5); // every discovered item still has its own row
-    expect(appended.filter((r) => r[1] === "item-1")).toHaveLength(3);
+    // One row per unique item, not per occurrence: a Drive shortcut must not
+    // double-count a resume, and this is what makes a source safe to *restart*
+    // discovery over another API mid-run (the re-yielded prefix dedupes away).
+    expect(res.processed).toBe(2);
+    expect(res.rowsWritten).toBe(3); // 2 unique items + header
+    expect(appended.filter((r) => r[1] === "item-1")).toHaveLength(1);
+  });
+
+  it("dedupes a source that restarts discovery mid-run (cross-API fallback)", async () => {
+    // REST yields items 1-3 then dies; the fallback re-discovers 1-5 over
+    // GraphQL. The runner must end with exactly 5 rows, not 8.
+    const restarting: Source<Item> = {
+      id: "restarting",
+      sourceColumn: "Item",
+      identify: (item) => ({ id: String(item.id), label: `item-${item.id}` }),
+      async *pages() {
+        yield [{ id: 1 }, { id: 2 }, { id: 3 }]; // REST, before the outage hits
+        yield [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }]; // GraphQL redo
+      },
+    };
+    const res = await runJob({ source: restarting, transform: fakeTransform(), sheetTitle: "t", ctx });
+    expect(res.processed).toBe(5);
+    expect(res.rowsWritten).toBe(6);
   });
 
   it("turns a whole-batch throw into per-item failure rows, not a lost batch", async () => {
@@ -237,10 +258,41 @@ describe("runJob", () => {
     expect(res.rowsWritten).toBe(121);
   });
 
-  it("retries a failed sheet append rather than losing the rows", async () => {
+  it("retries a failed sheet append rather than losing the rows, and counts the retries", async () => {
     failAppendsRemaining = 2; // first two appends 429
     const res = await runJob({ source: fakeSource(10), transform: fakeTransform(), sheetTitle: "t", ctx });
     expect(res.rowsWritten).toBe(11);
+    // A run that survived on backoff must say so in its result, not look
+    // identical to one that never blipped.
+    expect(res.stats.sheet_append_retries).toBe(2);
+  });
+
+  it("counts transform retries in the result stats", async () => {
+    let failures = 3;
+    const res = await runJob({
+      source: fakeSource(4),
+      transform: fakeTransform({
+        batchSize: 1,
+        run: async (items) => {
+          if (failures > 0) {
+            failures--;
+            throw new Error("429 rate limit");
+          }
+          return items.map((i) => ({ ok: true as const, cells: [`v${i.id}`] }));
+        },
+      }),
+      sheetTitle: "t",
+      ctx,
+      concurrency: 1,
+    });
+    expect(res.succeeded).toBe(4);
+    expect(res.stats.transform_retries).toBe(3);
+  });
+
+  it("reports no retry counters at all on a clean run", async () => {
+    const res = await runJob({ source: fakeSource(5), transform: fakeTransform(), sheetTitle: "t", ctx });
+    expect(res.stats.sheet_append_retries).toBeUndefined();
+    expect(res.stats.transform_retries).toBeUndefined();
   });
 
   it("creates no sheet when the source is empty", async () => {
@@ -248,6 +300,24 @@ describe("runJob", () => {
     expect(res.processed).toBe(0);
     expect(res.outputUrl).toBe("");
     expect(appended).toHaveLength(0);
+  });
+
+  it("resolves concurrency as caller > env > preset > engine default", () => {
+    const drive = JOB_PRESETS.drive_resumes!;
+    const github = JOB_PRESETS.github_issues!;
+
+    // Caller wins over everything.
+    expect(resolveConcurrency(3, drive, "50")).toBe(3);
+    // Env wins over the preset.
+    expect(resolveConcurrency(undefined, drive, "8")).toBe(8);
+    // Preset when no caller/env: drive is measured at 20.
+    expect(resolveConcurrency(undefined, drive, undefined)).toBe(20);
+    // GitHub has no measured override — falls through to the engine default.
+    expect(resolveConcurrency(undefined, github, undefined)).toBeUndefined();
+    // Garbage env values are ignored, not treated as 0 or NaN.
+    expect(resolveConcurrency(undefined, drive, "fast")).toBe(20);
+    expect(resolveConcurrency(undefined, drive, "0")).toBe(20);
+    expect(resolveConcurrency(undefined, drive, "-4")).toBe(20);
   });
 
   it("returns only compact counts and a URL — no rows, no item content", async () => {
@@ -368,5 +438,34 @@ describe("transform parsing", () => {
       lastJob: "Unknown",
     });
     expect(parseCandidate("garbage")).toEqual({ name: "Unknown", university: "Unknown", lastJob: "Unknown" });
+  });
+});
+
+describe("github graphql fallback", () => {
+  const { isProviderErrorPage, parseGraphqlIssuesPage, graphqlNodeToIssue } = require("./sources/github-issues");
+
+  it("recognizes a provider HTML error page, not a normal API error", () => {
+    expect(isProviderErrorPage(new Error("failed: <!DOCTYPE html><html><title>Unicorn! · GitHub</title>"))).toBe(true);
+    expect(isProviderErrorPage(new Error("404 not found"))).toBe(false);
+    expect(isProviderErrorPage(new Error("401 unauthorized"))).toBe(false);
+  });
+
+  it("parses either GraphQL envelope wrapping", () => {
+    const issues = { pageInfo: { hasNextPage: true, endCursor: "abc" }, nodes: [{ number: 1 }] };
+    expect(parseGraphqlIssuesPage({ data: { data: { repository: { issues } } } })?.endCursor).toBe("abc");
+    expect(parseGraphqlIssuesPage({ data: { repository: { issues } } })?.nodes).toHaveLength(1);
+    expect(parseGraphqlIssuesPage({ data: {} })).toBeNull();
+  });
+
+  it("normalizes a GraphQL node to the REST issue shape", () => {
+    const issue = graphqlNodeToIssue({
+      number: 42, title: "t", state: "CLOSED", createdAt: "2026-01-01T00:00:00Z",
+      url: "https://github.com/o/r/issues/42", body: "b",
+      labels: { nodes: [{ name: "bug" }, { name: "p1" }] },
+    });
+    // state lowercased so classify() buckets REST and GraphQL identically
+    expect(issue.state).toBe("closed");
+    expect(issue.labels).toEqual(["bug", "p1"]);
+    expect(issue.number).toBe(42);
   });
 });

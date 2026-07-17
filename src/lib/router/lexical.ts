@@ -113,6 +113,11 @@ export class LexicalIndex {
     return this.n;
   }
 
+  /** Whether this exact token appears anywhere in the indexed catalog's vocabulary. */
+  hasTerm(token: string): boolean {
+    return this.df.has(token);
+  }
+
   private idf(token: string): number {
     return Math.log(1 + this.n / (this.df.get(token) ?? this.n));
   }

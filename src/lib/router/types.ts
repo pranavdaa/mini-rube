@@ -71,6 +71,12 @@ export interface ParsedQuery {
   hintedToolkits: string[];
   /** Sub-app facets the query implies, e.g. gmail, sheets. */
   hintedFacets: string[];
+  /**
+   * True when the query names a person the catalog doesn't recognize as
+   * vocabulary ("with karan") — the contacts prerequisite was seeded by
+   * position, not lexical overlap. See scoring.ts's impliesUnresolvedPerson.
+   */
+  impliesPerson: boolean;
 }
 
 export interface RouteResult {
@@ -83,3 +89,12 @@ export interface RouteResult {
 
 export type QueryAspect = "read" | "write" | "mixed" | null;
 export type ToolAspect = "read" | "write";
+
+/**
+ * Toolkit slug for locally-implemented capabilities (see lib/local/capabilities.ts)
+ * — server-side workflows that aren't a single Composio tool call, indexed and
+ * scored by the same router as everything else. Not tied to any one Composio
+ * toolkit's vocabulary, so it's exempt from toolkit-affinity scoring (see
+ * scoring.ts) rather than penalized for "missing" a toolkit hint.
+ */
+export const LOCAL_TOOLKIT = "local";

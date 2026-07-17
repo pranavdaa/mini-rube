@@ -1,5 +1,6 @@
 import { composio } from "../composio";
 import { normalizeTool } from "./normalize";
+import { LOCAL_CAPABILITIES, toCompactTool } from "../local/capabilities";
 import type { CompactTool } from "./types";
 
 /**
@@ -53,7 +54,12 @@ export async function fetchToolkitCatalog(toolkit: string): Promise<CompactTool[
   return items.map((item) => normalizeTool(item, toolkit)).filter((t) => !!t.slug);
 }
 
-/** Fetch every configured toolkit's complete catalog. */
+/**
+ * Fetch every configured toolkit's complete catalog, plus locally-implemented
+ * capabilities (see lib/local/capabilities.ts). Local capabilities are indexed
+ * and scored by the exact same router as real Composio tools — a new one is a
+ * registry entry, not a special case here.
+ */
 export async function fetchCatalog(toolkits: string[] = TOOLKITS): Promise<CompactTool[]> {
   const perToolkit = await Promise.all(toolkits.map(fetchToolkitCatalog));
 
@@ -65,6 +71,12 @@ export async function fetchCatalog(toolkits: string[] = TOOLKITS): Promise<Compa
       seen.add(tool.slug);
       tools.push(tool);
     }
+  }
+  for (const cap of LOCAL_CAPABILITIES) {
+    const tool = toCompactTool(cap);
+    if (seen.has(tool.slug)) continue;
+    seen.add(tool.slug);
+    tools.push(tool);
   }
   return tools;
 }
@@ -95,4 +107,25 @@ export function catalogCounts(tools: CompactTool[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const t of tools) counts[t.toolkit] = (counts[t.toolkit] ?? 0) + 1;
   return counts;
+}
+
+/**
+ * Fingerprint of the catalog's contents: every slug at its exact version.
+ *
+ * Used to key caches, so a cached decision is discarded the moment Composio
+ * ships a tool change rather than being served against a catalog that no longer
+ * exists. FNV-1a — not cryptographic, just a stable content hash.
+ */
+export function catalogVersion(tools: CompactTool[]): string {
+  const signature = tools
+    .map((t) => `${t.slug}@${t.version ?? "?"}`)
+    .sort()
+    .join("\n");
+
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < signature.length; i++) {
+    hash ^= signature.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }

@@ -159,6 +159,22 @@ export interface Facet {
   markers: string[];
 }
 
+/**
+ * Prepositions that, followed by a word the catalog itself doesn't know,
+ * usually name a person ("with karan", "invite karan"). See
+ * `impliesUnresolvedPerson` in scoring.ts.
+ */
+export const PERSON_PREPOSITIONS = new Set(["with", "to", "for", "invite", "inviting"]);
+
+/** Relative-time vocabulary that can follow a person preposition without naming anyone. */
+export const TIME_WORDS = new Set(
+  ("today tomorrow tonight yesterday morning afternoon evening noon midnight " +
+    "monday tuesday wednesday thursday friday saturday sunday " +
+    "january february march april june july august september october november december " +
+    "am pm week month year hour minute")
+    .split(" ")
+);
+
 export const FACETS: Facet[] = [
   {
     id: "gmail",
